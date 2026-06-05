@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #define HEADER_LEN      4
 #define MAX_MSG_SIZE    65536
@@ -13,7 +14,6 @@
 #define BUF_SIZE        65536
 
 /* Paquet : [4 bytes payload length LE][payload] */
-/* Retourne la taille totale du paquet ou -1 si plen invalide */
 static inline int pack_msg(const uint8_t *payload, int plen, uint8_t *out) {
     if (plen < 0 || plen > MAX_MSG_SIZE) return -1;
     out[0] = plen & 0xFF;
@@ -25,8 +25,6 @@ static inline int pack_msg(const uint8_t *payload, int plen, uint8_t *out) {
     return HEADER_LEN + plen;
 }
 
-/* Extrait un message du buffer. 
-   Retourne le nombre d'octets consommés, 0 si pas assez de données, -1 si erreur */
 static inline int try_unpack(const uint8_t *buf, int blen,
                              uint8_t *msg_out, int *msg_len) {
     if (blen < HEADER_LEN) return 0;
