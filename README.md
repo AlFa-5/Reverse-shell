@@ -49,6 +49,11 @@ Le projet utilise un fichier Makefile pour automatiser et standardiser le proces
 * Un environnement de type UNIX (Linux, WSL, ou macOS avec les outils de développement).
 * La bibliothèque standard statique (le paquet libc-static peut être requis sur certaines distributions comme Alpine ou CentOS/Fedora).
 
+### Installation requise
+```bash
+sudo apt install musl-tools
+```
+
 ### Instructions de compilation
 
 Pour compiler le serveur et le client simultanément, placez-vous dans le répertoire du projet et exécutez :
@@ -65,3 +70,13 @@ Le binaire client obtenu par la compilation est dynamique. Cela signifie qu'il s
 ```bash
 ./client [port] [ip_serveur]
 ```
+
+### Multi-client
+```bash
+set [numero_session]
+```
+Choisir la machine à contrôler
+```bash
+back
+```
+Revenir sur le choix du machine
